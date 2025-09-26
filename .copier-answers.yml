@@ -1,0 +1,18 @@
+# Changes here will be overwritten by Copier; NEVER EDIT MANUALLY
+_commit: v1.1.0
+_src_path: https://github.com/napari/napari-plugin-template
+display_name: Embryo VNC Align Frontend
+email: peternewstein@gmail.com
+full_name: Peter Newstein
+github_repository_url: https://github.com/pnewstein/embryo-vnc-align-napari-frontend
+github_username_or_organization: pnewstein
+include_reader_plugin: false
+include_sample_data_plugin: false
+include_widget_plugin: true
+include_writer_plugin: false
+install_dependabot: true
+install_precommit: false
+license: GNU GPL v3.0
+module_name: embryo_vnc_align_napari_frontend
+plugin_name: embryo-vnc-align-napari-frontend
+short_description: A frontend to use embryo-vnc-align over ssh
