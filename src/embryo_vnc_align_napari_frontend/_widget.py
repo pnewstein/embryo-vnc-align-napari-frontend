@@ -23,19 +23,21 @@ from qt_remote_commands_over_ssh_for_napari_plugins import (
     add_widgets,
     Client,
     to_string,
+    raise_exception,
 )
 from napari.layers import Image, Points
-from napari.qt.threading import thread_worker
+from napari.qt.threading import thread_worker, FunctionWorker
 import numpy as np
 from tifffile import TiffFile, TiffFrame
 
 logging.basicConfig(
-    filename='app.log',
-    filemode='a',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    force=True,  # <- ensures it takes effect
+    filename="app.log",
+    filemode="a",
+    level=logging.DEBUG,
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
+
+logger = logging.getLogger(__name__)
 
 
 AddImageKwargs = dict[
@@ -86,7 +88,8 @@ def image_args_from_path(path: Path) -> AddImageKwargs:
         namespace = {"ome": next(iter(mdata.attrib.values())).split()[0]}
         pixels = image.find("ome:Pixels", namespaces=namespace)
         channel_names = [
-            ch.attrib["Name"] for ch in mdata.findall(".//ome:Channel", namespace)
+            ch.attrib["Name"]
+            for ch in mdata.findall(".//ome:Channel", namespace)
         ]
         assert pixels is not None
         scale = (
@@ -159,12 +162,14 @@ class RotateVnc(QWidget):
         self.scene_idx.setText("0")
         scene_idx_row.addWidget(self.scene_idx)
         layout.addLayout(scene_idx_row)
-        submit_button = QPushButton("Submit Coords")
-        submit_button.clicked.connect(self.send_rotation_identification_request)
-        layout.addWidget(submit_button)
-        rotate_button = QPushButton("Rotate Image")
-        rotate_button.clicked.connect(self.send_apply_rotation_request)
-        layout.addWidget(rotate_button)
+        self.submit_button = QPushButton("Submit Coords")
+        self.submit_button.clicked.connect(
+            self.send_rotation_identification_request
+        )
+        layout.addWidget(self.submit_button)
+        self.rotate_button = QPushButton("Rotate Image")
+        self.rotate_button.clicked.connect(self.send_apply_rotation_request)
+        layout.addWidget(self.rotate_button)
 
         try:
             self.reference_layer = next(
@@ -193,7 +198,9 @@ class RotateVnc(QWidget):
             text="text",
         )
         self.lateral.mode = "add"
-        self.lateral.events.data.connect(get_points_name_callback(["side", "side"]))
+        self.lateral.events.data.connect(
+            get_points_name_callback(["side", "side"])
+        )
         self._client: Client | None = None
 
         self.cm.host_name.setText("localhost")
@@ -207,27 +214,19 @@ class RotateVnc(QWidget):
         old_value = self.image_box.currentText()
         self.image_box.clear()
         # avoid repeat labels
-        values = set(l.name for l in self.viewer.layers if isinstance(l, Image))
+        values = set(
+            l.name for l in self.viewer.layers if isinstance(l, Image)
+        )
         self.image_box.addItems(list(values))
         if old_value in values:
             self.image_box.setCurrentText(old_value)
         final_value = self.image_box.currentText()
         if final_value:
-            scene_or_none = self.viewer.layers[final_value].metadata.get("scene_index")
+            scene_or_none = self.viewer.layers[final_value].metadata.get(
+                "scene_index"
+            )
             if scene_or_none is not None:
                 self.scene_idx.setText(str(scene_or_none))
-
-    def get_client(self) -> Client:
-        if (
-            self._client is not None
-            and self._client.proc is not None
-            and self._client.proc.poll() is None
-        ):
-            return self._client
-        out = self.cm.enter_client()
-        assert out is not None
-        self._client = out
-        return out
 
     def get_coords(
         self,
@@ -238,10 +237,6 @@ class RotateVnc(QWidget):
         anterior, posterior = self.anterior_posterior.data[:2]
         s1, s2 = self.lateral.data[:2]
         return anterior, s1, s2, posterior
-
-    def __del__(self):
-        if self._client is not None and self._client.proc is not None:
-            self._client.__exit__(None, None, None)
 
     @thread_worker
     def send_rotation_identification_request_thread(
@@ -262,26 +257,39 @@ class RotateVnc(QWidget):
         np.save(in_path, img_as_ubyte(zoomed_data))
         # write to the server
         coords = [c.tolist() for c in self.get_coords()]
-        client = self.get_client()
-        assert client.working_path is not None
         rir = RotationIdentificationRequest(
-                coords=(coords * in_scale / out_scale).tolist(), # type: ignore
+            coords=(coords * in_scale / out_scale).tolist(),  # type: ignore
             scale=[out_scale] * 3,
             index=int(self.scene_idx.text()),
             input_path=str(in_path),
             pixel_buffer_factor=float(self.pix_bf.text()),
             height=float(self.vnc_depth.text()),
         )
-        client.send_file(in_path)
-        response = client.request(to_string(rir), timeout=9999)
-        if response.error:
-            raise RuntimeError("error encountered")
+        try:
+            with self.cm as client:
+                client.send_file(in_path)
+                response = client.request(to_string(rir), timeout=9999)
+                if response.error:
+                    raise RuntimeError(response.error)
+        finally:
+            in_path.unlink(missing_ok=True)
         file = Path(response.out)
         client.receive_file(file, file)
         logger.info(response)
-        return image_args_from_path(file) | {"name": "preview"}
+        try:
+            out = image_args_from_path(file) | {"name": "preview"}
+        finally:
+            file.unlink(missing_ok=True)
+        return out
+
+    def post_rotation_identification_request(self, kwargs: AddImageKwargs):
+        self.submit_button.setChecked(False)
+        self.submit_button.setEnabled(True)
+        viewer.add_image(**kwargs)
 
     def send_rotation_identification_request(self, *args):
+        self.submit_button.setChecked(True)
+        self.submit_button.setEnabled(False)
         _ = args
         # verify layers
         try:
@@ -289,14 +297,10 @@ class RotateVnc(QWidget):
         except ValueError:
             print("You must populate layers")
             return
-        worker = self.send_rotation_identification_request_thread()
-        worker.returned.connect(lambda kwargs: self.viewer.add_image(**kwargs)) # type: ignore
-
-        def error_callback(e: Exception):
-            raise e
-
-        worker.errored.connect(error_callback) # type: ignore
-        worker.start() # type: ignore
+        worker: FunctionWorker = self.send_rotation_identification_request_thread()  # type: ignore
+        worker.returned.connect(self.post_rotation_identification_request)
+        worker.errored.connect(raise_exception)
+        worker.start()
 
     @thread_worker
     def send_apply_rotation_request_thread(self) -> AddImageKwargs:
@@ -340,50 +344,56 @@ class RotateVnc(QWidget):
         )
         logger.debug("Composing OME tiff")
         writer.write()
-        # send file
-        client = self.get_client()
-        client.send_file(multi_chan_path)
-        # copy over landmarks
-        client.remote_cp(
-            Path(f"reference-S{self.scene_idx.text()}.landmarks"),
-            Path(f"S{self.scene_idx.text()}.landmarks"),
-        )
-        # send request
-        assert client.working_path is not None
         arr = ApplyRotationRequest(
             input_path=str(multi_chan_path),
             index=int(self.scene_idx.text()),
             pixel_buffer_factor=float(self.pix_bf.text()),
             height=40,
         )
-        response = client.request(to_string(arr), 9999)
-        if response.error:
-            raise RuntimeError("error encountered")
+        # send file
+        try:
+            with self.cm as client:
+                client.send_file(multi_chan_path)
+                # copy over landmarks
+                client.remote_cp(
+                    Path(f"reference-S{self.scene_idx.text()}.landmarks"),
+                    Path(f"S{self.scene_idx.text()}.landmarks"),
+                )
+                response = client.request(to_string(arr), 9999)
+                if response.error:
+                    raise RuntimeError(response.error)
+        finally:
+            multi_chan_path.unlink(missing_ok=True)
         file = Path(response.out)
         client.receive_file(file, file)
         logger.info(response)
-        return image_args_from_path(file)
+        try:
+            out = image_args_from_path(file)
+        finally:
+            file.unlink(missing_ok=True)
+        return out
+
+    def post_rotation_request(self, kwargs: AddImageKwargs):
+        self.rotate_button.setChecked(False)
+        self.rotate_button.setEnabled(True)
+        self.viewer.add_image(**kwargs)
 
     def send_apply_rotation_request(self, arg):
+        self.rotate_button.setChecked(True)
+        self.rotate_button.setEnabled(False)
         _ = arg
         if "preview" not in self.viewer.layers[-1].name:
             print("you must first submit coords")
         # convert image into ometif
-        worker = self.send_apply_rotation_request_thread()
-        worker.returned.connect(lambda kwargs: self.viewer.add_image(**kwargs))
+        worker: FunctionWorker = self.send_apply_rotation_request_thread()  # type: ignore
+        worker.returned.connect(self.post_rotation_request)
 
-        def error_callback(e: Exception):
-            raise e
-
-        worker.errored.connect(error_callback)
+        worker.errored.connect(raise_exception)
         worker.start()
 
+    def closeEvent(self, a0):
+        """Clean up client connection when widget is closed"""
+        if self.cm._client:
+            self.cm._client.close()
+        super().closeEvent(a0)
 
-import napari_scripts as ns
-
-viewer = ns.get_viewer_from_file(
-    Path("~/elav_bh1ha-488ha647eve-s3l.czi"),
-    1,
-)
-self = RotateVnc(viewer)
-viewer.window.add_dock_widget(self)
